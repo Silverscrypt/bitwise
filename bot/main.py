@@ -1,42 +1,36 @@
 
-import os
 import asyncio
 
 import discord
 from discord.ext import commands
-from dotenv import load_dotenv
+
+from bot.config import TOKEN, GUILD_ID, validate_config
 
 
-load_dotenv()
-
-TOKEN = os.getenv("DISCORD_TOKEN")
-GUILD_ID = os.getenv("GUILD_ID")
-
+# Configure bot intents
 intents = discord.Intents.default()
 
-
+# Bot class
 class BitsBot(commands.Bot):
 
     async def setup_hook(self):
-        """Runs once during startup, before Gateway events are processed."""
+        await self.load_extension("bot.commands.roles")
 
         guild = discord.Object(id=int(GUILD_ID))
-
-        # Copy global commands into our development server
         self.tree.copy_global_to(guild=guild)
-
-        # Register commands with Discord
         await self.tree.sync(guild=guild)
 
         print("Slash commands synchronized!")
 
 
+# Initialize bot
 bot = BitsBot(
     command_prefix="!",
     intents=intents
 )
 
 
+# Bot startup event
 @bot.event
 async def on_ready():
     print("Bits is online!")
@@ -44,15 +38,23 @@ async def on_ready():
     print(f"Bot ID: {bot.user.id}")
 
 
+# --------------------------------------------------
+# PING COMMAND
+# --------------------------------------------------
+
 @bot.tree.command(
     name="ping",
     description="Check whether Bits is responsive."
 )
 async def ping(interaction: discord.Interaction):
+    
     await interaction.response.send_message(
         "Pong! Bits is operational."
     )
 
+# --------------------------------------------------
+# MAIN
+# --------------------------------------------------
 
 async def main():
     async with bot:
@@ -60,10 +62,5 @@ async def main():
 
 
 if __name__ == "__main__":
-    if not TOKEN:
-        raise RuntimeError("DISCORD_TOKEN is missing from .env")
-
-    if not GUILD_ID:
-        raise RuntimeError("GUILD_ID is missing from .env")
-
+    validate_config()
     asyncio.run(main())
