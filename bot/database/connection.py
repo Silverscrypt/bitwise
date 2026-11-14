@@ -1,29 +1,48 @@
-import os
+from contextlib import asynccontextmanager
 
-import psycopg
-from dotenv import load_dotenv
+from psycopg_pool import AsyncConnectionPool
 
-load_dotenv()
+from bot.database.models import create_all_tables
+from bot.database.repositories import Repository
 
 
-def get_connection():
-    required_variables = [
-        "DB_HOST",
-        "DB_PORT",
-        "DB_NAME",
-        "DB_USER"
-    ]
+class Database:
+    """Owns the connection pool and hands out transactional repositories.
 
-    for variable in required_variables:
-        if not os.getenv(variable):
-            raise RuntimeError(
-                f"{variable} is missing from .env"
-            )
+    Usage:
 
-    return psycopg.connect(
-        host=os.getenv("DB_HOST"),
-        port=os.getenv("DB_PORT"),
-        dbname=os.getenv("DB_NAME"),
-        user=os.getenv("DB_USER"),
-        password=os.getenv("DB_PASSWORD") or None
-    )
+        async with db.transaction() as repo:
+            await repo.assign_role(...)
+            await repo.add_audit_log(...)
+
+    Everything inside the block commits together, or rolls back together if
+    an exception escapes it. Services rely on this to undo database writes
+    when the matching Discord role change fails.
+    """
+
+    def __init__(self, database_url, min_size=1, max_size=5):
+        self._pool = AsyncConnectionPool(
+            database_url,
+            min_size=min_size,
+            max_size=max_size,
+            open=False,
+        )
+
+    async def open(self):
+        await self._pool.open(wait=True, timeout=15)
+
+        async with self._pool.connection() as conn:
+            await create_all_tables(conn)
+
+    async def close(self):
+        await self._pool.close()
+
+    @asynccontextmanager
+    async def transaction(self):
+        async with self._pool.connection() as conn:
+            async with conn.transaction():
+                yield Repository(conn)
+
+    async def ping(self):
+        async with self._pool.connection() as conn:
+            await conn.execute("SELECT 1")

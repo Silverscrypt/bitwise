@@ -1,225 +1,355 @@
-from bot.database.connection import get_connection
+"""SQL access for Bitwise.
 
-# --------------------------------------------------
-# MEMBER REPOSITORY COMMANDS
-# --------------------------------------------------
+A Repository wraps one connection that is already inside a transaction
+(see Database.transaction), so several calls made through the same
+Repository commit or roll back together. Repositories only read and write
+data: authorization and Discord calls belong to the services.
+"""
 
-def add_member(discord_id, username):
-    with get_connection() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(
+from psycopg.rows import class_row
+from psycopg.types.json import Jsonb
+
+from bot.database.models import (
+    LeaderRecord,
+    MemberRecord,
+    ProjectRecord,
+    RoleRecord,
+)
+
+
+class Repository:
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    async def _fetch_one(self, row_type, query, params=()):
+        async with self._conn.cursor(row_factory=class_row(row_type)) as cursor:
+            await cursor.execute(query, params)
+            return await cursor.fetchone()
+
+    async def _fetch_all(self, row_type, query, params=()):
+        async with self._conn.cursor(row_factory=class_row(row_type)) as cursor:
+            await cursor.execute(query, params)
+            return await cursor.fetchall()
+
+    async def _execute(self, query, params=()):
+        async with self._conn.cursor() as cursor:
+            await cursor.execute(query, params)
+            return cursor.rowcount
+
+    # --------------------------------------------------
+    # MEMBERS
+    # --------------------------------------------------
+
+    async def upsert_member(self, discord_id, username):
+        await self._execute(
+            """
+            INSERT INTO members (discord_id, username)
+            VALUES (%s, %s)
+            ON CONFLICT (discord_id)
+            DO UPDATE SET username = EXCLUDED.username;
+            """,
+            (discord_id, username),
+        )
+
+    async def get_member(self, discord_id):
+        return await self._fetch_one(
+            MemberRecord,
+            """
+            SELECT discord_id, username, joined_at
+            FROM members
+            WHERE discord_id = %s;
+            """,
+            (discord_id,),
+        )
+
+    # --------------------------------------------------
+    # ROLES
+    # --------------------------------------------------
+
+    async def create_role(self, name, category, discord_role_id):
+        """Register a role. Returns None if the name or Discord role is taken."""
+
+        return await self._fetch_one(
+            RoleRecord,
+            """
+            INSERT INTO roles (name, category, discord_role_id)
+            VALUES (%s, %s, %s)
+            ON CONFLICT DO NOTHING
+            RETURNING id, name, category, discord_role_id;
+            """,
+            (name, category, discord_role_id),
+        )
+
+    async def delete_role(self, role_id):
+        return await self._execute(
+            "DELETE FROM roles WHERE id = %s;", (role_id,)
+        ) > 0
+
+    async def get_role_by_name(self, name):
+        return await self._fetch_one(
+            RoleRecord,
+            """
+            SELECT id, name, category, discord_role_id
+            FROM roles
+            WHERE lower(name) = lower(%s);
+            """,
+            (name,),
+        )
+
+    async def get_role_by_discord_id(self, discord_role_id):
+        return await self._fetch_one(
+            RoleRecord,
+            """
+            SELECT id, name, category, discord_role_id
+            FROM roles
+            WHERE discord_role_id = %s;
+            """,
+            (discord_role_id,),
+        )
+
+    async def list_roles(self, category=None):
+        if category is None:
+            return await self._fetch_all(
+                RoleRecord,
                 """
-                INSERT INTO members (discord_id, username)
-                VALUES (%s, %s)
-                ON CONFLICT (discord_id)
-                DO UPDATE SET username = EXCLUDED.username;
-                """,
-                (discord_id, username)
-            )
-
-def get_member(discord_id):
-    with get_connection() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT discord_id, username, joined_at
-                FROM members
-                WHERE discord_id = %s;
-                """,
-                (discord_id,)
-            )
-            return cursor.fetchone()
-
-def delete_member(discord_id):
-    with get_connection() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(
-                """
-                DELETE FROM members
-                WHERE discord_id = %s;
-                """,
-                (discord_id,)
-            )
-            return cursor.rowcount > 0
-
-# --------------------------------------------------
-# ROLE REPOSITORY COMMANDS
-# --------------------------------------------------
-
-def add_role(name, category):
-    with get_connection() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(
-                """
-                INSERT INTO roles (name, category)
-                VALUES (%s, %s)
-                ON CONFLICT (name) DO NOTHING;
-                """,
-                (name, category)
-            )
-
-def get_role(name):
-    with get_connection() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT id, name, category
+                SELECT id, name, category, discord_role_id
                 FROM roles
-                WHERE name = %s;
+                ORDER BY category, name;
                 """,
-                (name,)
             )
-            return cursor.fetchone()
-        
-def delete_role(name):
-    with get_connection() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(
+
+        return await self._fetch_all(
+            RoleRecord,
+            """
+            SELECT id, name, category, discord_role_id
+            FROM roles
+            WHERE category = %s
+            ORDER BY name;
+            """,
+            (category,),
+        )
+
+    async def assign_role(self, member_id, role_id):
+        """Returns False if the member already had the role."""
+
+        return await self._execute(
+            """
+            INSERT INTO member_roles (member_id, role_id)
+            VALUES (%s, %s)
+            ON CONFLICT DO NOTHING;
+            """,
+            (member_id, role_id),
+        ) > 0
+
+    async def remove_role(self, member_id, role_id):
+        """Returns False if the member did not have the role."""
+
+        return await self._execute(
+            """
+            DELETE FROM member_roles
+            WHERE member_id = %s AND role_id = %s;
+            """,
+            (member_id, role_id),
+        ) > 0
+
+    async def get_member_roles(self, member_id):
+        return await self._fetch_all(
+            RoleRecord,
+            """
+            SELECT roles.id, roles.name, roles.category, roles.discord_role_id
+            FROM roles
+            JOIN member_roles ON roles.id = member_roles.role_id
+            WHERE member_roles.member_id = %s
+            ORDER BY roles.category, roles.name;
+            """,
+            (member_id,),
+        )
+
+    # --------------------------------------------------
+    # PROJECTS
+    # --------------------------------------------------
+
+    async def create_project(self, name, description, discord_role_id):
+        """Returns None if the name or Discord role is already used."""
+
+        return await self._fetch_one(
+            ProjectRecord,
+            """
+            INSERT INTO projects (name, description, discord_role_id)
+            VALUES (%s, %s, %s)
+            ON CONFLICT DO NOTHING
+            RETURNING id, name, description, discord_role_id, created_at;
+            """,
+            (name, description, discord_role_id),
+        )
+
+    async def delete_project(self, project_id):
+        return await self._execute(
+            "DELETE FROM projects WHERE id = %s;", (project_id,)
+        ) > 0
+
+    async def get_project(self, name):
+        return await self._fetch_one(
+            ProjectRecord,
+            """
+            SELECT id, name, description, discord_role_id, created_at
+            FROM projects
+            WHERE lower(name) = lower(%s);
+            """,
+            (name,),
+        )
+
+    async def get_project_by_discord_id(self, discord_role_id):
+        return await self._fetch_one(
+            ProjectRecord,
+            """
+            SELECT id, name, description, discord_role_id, created_at
+            FROM projects
+            WHERE discord_role_id = %s;
+            """,
+            (discord_role_id,),
+        )
+
+    async def list_projects(self):
+        return await self._fetch_all(
+            ProjectRecord,
+            """
+            SELECT id, name, description, discord_role_id, created_at
+            FROM projects
+            ORDER BY name;
+            """,
+        )
+
+    async def add_project_member(self, project_id, member_id):
+        """Returns False if the member was already on the project."""
+
+        return await self._execute(
+            """
+            INSERT INTO project_members (project_id, member_id)
+            VALUES (%s, %s)
+            ON CONFLICT DO NOTHING;
+            """,
+            (project_id, member_id),
+        ) > 0
+
+    async def remove_project_member(self, project_id, member_id):
+        return await self._execute(
+            """
+            DELETE FROM project_members
+            WHERE project_id = %s AND member_id = %s;
+            """,
+            (project_id, member_id),
+        ) > 0
+
+    async def get_project_members(self, project_id):
+        return await self._fetch_all(
+            MemberRecord,
+            """
+            SELECT members.discord_id, members.username, members.joined_at
+            FROM members
+            JOIN project_members ON members.discord_id = project_members.member_id
+            WHERE project_members.project_id = %s
+            ORDER BY lower(members.username);
+            """,
+            (project_id,),
+        )
+
+    async def get_member_projects(self, member_id):
+        return await self._fetch_all(
+            ProjectRecord,
+            """
+            SELECT projects.id, projects.name, projects.description,
+                   projects.discord_role_id, projects.created_at
+            FROM projects
+            JOIN project_members ON projects.id = project_members.project_id
+            WHERE project_members.member_id = %s
+            ORDER BY projects.name;
+            """,
+            (member_id,),
+        )
+
+    # --------------------------------------------------
+    # PROJECT LEADERSHIP
+    # --------------------------------------------------
+
+    async def set_project_leader(self, project_id, member_id, level):
+        """Insert or change a member's leadership level on a project."""
+
+        await self._execute(
+            """
+            INSERT INTO project_managers (project_id, member_id, level)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (project_id, member_id)
+            DO UPDATE SET level = EXCLUDED.level, assigned_at = CURRENT_TIMESTAMP;
+            """,
+            (project_id, member_id, level),
+        )
+
+    async def remove_project_leader(self, project_id, member_id):
+        return await self._execute(
+            """
+            DELETE FROM project_managers
+            WHERE project_id = %s AND member_id = %s;
+            """,
+            (project_id, member_id),
+        ) > 0
+
+    async def get_leadership_level(self, project_id, member_id):
+        """Returns 'lead', 'manager', or None."""
+
+        async with self._conn.cursor() as cursor:
+            await cursor.execute(
                 """
-                DELETE FROM roles
-                WHERE name = %s;
+                SELECT level FROM project_managers
+                WHERE project_id = %s AND member_id = %s;
                 """,
-                (name,)
+                (project_id, member_id),
             )
-            return cursor.rowcount > 0
+            row = await cursor.fetchone()
+            return row[0] if row else None
 
-def assign_role(discord_id, role_name):
-    with get_connection() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(
-                """
-                INSERT INTO member_roles (member_id, role_id)
-                SELECT members.discord_id, roles.id
-                FROM members, roles
-                WHERE members.discord_id = %s
-                AND roles.name = %s
-                ON CONFLICT DO NOTHING;
-                """,
-                (discord_id, role_name)
-            )
-            return cursor.rowcount > 0
+    async def get_project_leaders(self, project_id):
+        return await self._fetch_all(
+            LeaderRecord,
+            """
+            SELECT projects.id AS project_id, projects.name AS project_name,
+                   members.discord_id AS member_id, members.username,
+                   project_managers.level
+            FROM project_managers
+            JOIN projects ON projects.id = project_managers.project_id
+            JOIN members ON members.discord_id = project_managers.member_id
+            WHERE project_managers.project_id = %s
+            ORDER BY project_managers.level, lower(members.username);
+            """,
+            (project_id,),
+        )
 
-def remove_role(discord_id, role_name):
-    with get_connection() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(
-                """
-                DELETE FROM member_roles
-                WHERE member_id = %s
-                AND role_id = (
-                    SELECT id FROM roles WHERE name = %s
-                );
-                """,
-                (discord_id, role_name)
-            )
-            return cursor.rowcount > 0
+    async def get_member_leadership(self, member_id):
+        return await self._fetch_all(
+            LeaderRecord,
+            """
+            SELECT projects.id AS project_id, projects.name AS project_name,
+                   members.discord_id AS member_id, members.username,
+                   project_managers.level
+            FROM project_managers
+            JOIN projects ON projects.id = project_managers.project_id
+            JOIN members ON members.discord_id = project_managers.member_id
+            WHERE project_managers.member_id = %s
+            ORDER BY projects.name;
+            """,
+            (member_id,),
+        )
 
-def get_member_roles(discord_id):
-    with get_connection() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT roles.id, roles.name, roles.category
-                FROM roles
-                JOIN member_roles
-                    ON roles.id = member_roles.role_id
-                WHERE member_roles.member_id = %s;
-                """,
-                (discord_id,)
-            )
-            return cursor.fetchall()
+    # --------------------------------------------------
+    # AUDIT LOG
+    # --------------------------------------------------
 
-# --------------------------------------------------
-# PROJECT REPOSITORY COMMANDS
-# --------------------------------------------------
-
-def add_project(name, description=None):
-    with get_connection() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(
-                """
-                INSERT INTO projects (name, description)
-                VALUES (%s, %s)
-                ON CONFLICT (name) DO NOTHING;
-                """,
-                (name, description)
-            )
-            return cursor.rowcount > 0
-
-
-def get_project(name):
-    with get_connection() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT id, name, description, created_at
-                FROM projects
-                WHERE name = %s;
-                """,
-                (name,)
-            )
-            return cursor.fetchone()
-
-
-def delete_project(name):
-    with get_connection() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(
-                """
-                DELETE FROM projects
-                WHERE name = %s;
-                """,
-                (name,)
-            )
-            return cursor.rowcount > 0
-
-
-def assign_project(discord_id, project_name):
-    with get_connection() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(
-                """
-                INSERT INTO project_members (project_id, member_id)
-                SELECT projects.id, members.discord_id
-                FROM projects, members
-                WHERE projects.name = %s
-                AND members.discord_id = %s
-                ON CONFLICT DO NOTHING;
-                """,
-                (project_name, discord_id)
-            )
-            return cursor.rowcount > 0
-
-
-def remove_project(discord_id, project_name):
-    with get_connection() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(
-                """
-                DELETE FROM project_members
-                WHERE member_id = %s
-                AND project_id = (
-                    SELECT id FROM projects WHERE name = %s
-                );
-                """,
-                (discord_id, project_name)
-            )
-            return cursor.rowcount > 0
-
-
-def get_project_members(project_name):
-    with get_connection() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT members.discord_id, members.username
-                FROM members
-                JOIN project_members
-                    ON members.discord_id = project_members.member_id
-                JOIN projects
-                    ON projects.id = project_members.project_id
-                WHERE projects.name = %s;
-                """,
-                (project_name,)
-            )
-            return cursor.fetchall()
+    async def add_audit_log(self, actor_id, action, target_id=None, details=None):
+        await self._execute(
+            """
+            INSERT INTO audit_logs (actor_id, action, target_id, details)
+            VALUES (%s, %s, %s, %s);
+            """,
+            (actor_id, action, target_id, Jsonb(details or {})),
+        )

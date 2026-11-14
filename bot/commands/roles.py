@@ -1,96 +1,101 @@
+"""/role commands: functional roles and role registration.
+
+Commands only translate between Discord and the RoleService. All rules
+(authorization, hierarchy, database consistency) live in the service.
+"""
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 
+from bot.commands.common import registered_role_autocomplete, reply, role_mention
+from bot.database.models import ROLE_CATEGORIES
 
-class RoleCommands(commands.Cog):
+
+CATEGORY_CHOICES = [
+    app_commands.Choice(name=category.title(), value=category)
+    for category in ROLE_CATEGORIES
+]
+
+
+@app_commands.guild_only()
+class RoleCommands(
+    commands.GroupCog,
+    group_name="role",
+    group_description="Manage organization roles.",
+):
 
     def __init__(self, bot):
         self.bot = bot
+        self.service = bot.role_service
+        super().__init__()
 
-    @discord.app_commands.command(
-        name="role_add",
-        description="Assign a role to a server member."
+    @app_commands.command(name="add", description="Give a member a functional role.")
+    @app_commands.describe(member="Who gets the role", role="A registered functional role")
+    async def add(self, interaction: discord.Interaction, member: discord.Member, role: discord.Role):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        if await self.service.add_role(interaction.user, member, role):
+            await reply(interaction, f"Gave {role.mention} to {member.mention}.")
+        else:
+            await reply(interaction, f"{member.mention} already has {role.mention}.")
+
+    @app_commands.command(name="remove", description="Remove a functional role from a member.")
+    @app_commands.describe(member="Who loses the role", role="A registered functional role")
+    async def remove(self, interaction: discord.Interaction, member: discord.Member, role: discord.Role):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        if await self.service.remove_role(interaction.user, member, role):
+            await reply(interaction, f"Removed {role.mention} from {member.mention}.")
+        else:
+            await reply(interaction, f"{member.mention} doesn't have {role.mention}.")
+
+    @app_commands.command(name="list", description="List the roles Bitwise manages.")
+    async def list_roles(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        roles = await self.service.list_roles()
+        if not roles:
+            await reply(interaction, "No roles are registered yet. Officers can add one with /role register.")
+            return
+
+        lines = [
+            f"**{role.name}** · {role.category} · {role_mention(role.discord_role_id)}"
+            for role in roles
+        ]
+        await reply(interaction, "\n".join(lines))
+
+    @app_commands.command(name="register", description="(Officers) Let Bitwise manage a Discord role.")
+    @app_commands.describe(
+        role="The Discord role",
+        category="Functional roles can be given with /role add; membership is granted by recruiting",
+        name="Name Bitwise uses for it (defaults to the Discord role name)",
     )
-    async def role_add(
+    @app_commands.choices(category=CATEGORY_CHOICES)
+    async def register(
         self,
         interaction: discord.Interaction,
-        member: discord.Member,
-        role: discord.Role
+        role: discord.Role,
+        category: app_commands.Choice[str],
+        name: app_commands.Range[str, 1, 100] | None = None,
     ):
-        officer_role = discord.utils.get(
-            interaction.guild.roles,
-            name="Officer"
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        record = await self.service.register_role(interaction.user, role, category.value, name)
+        await reply(interaction, f"Registered **{record.name}** ({record.category}) → {role.mention}.")
+
+    @app_commands.command(name="unregister", description="(Officers) Stop managing a role.")
+    @app_commands.describe(name="The registered role")
+    @app_commands.autocomplete(name=registered_role_autocomplete)
+    async def unregister(self, interaction: discord.Interaction, name: str):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        record = await self.service.unregister_role(interaction.user, name)
+        await reply(
+            interaction,
+            f"Unregistered **{record.name}**. Its assignment records were "
+            "deleted; members keep the Discord role until it's removed in Discord.",
         )
-
-        if officer_role is None:
-            await interaction.response.send_message(
-                "The Officer role could not be found.",
-                ephemeral=True
-            )
-            return
-
-        if officer_role not in interaction.user.roles:
-            await interaction.response.send_message(
-                "You must be an Officer to use this command.",
-                ephemeral=True
-            )
-            return
-
-        try:
-            await member.add_roles(role)
-
-            await interaction.response.send_message(
-                f"Successfully assigned {role.mention} to {member.mention}."
-            )
-
-        except discord.Forbidden:
-            await interaction.response.send_message(
-                "I don't have permission to assign that role. Check my role hierarchy.",
-                ephemeral=True
-            )
-
-    @discord.app_commands.command(
-        name="role_remove",
-        description="Remove a role from a server member."
-    )
-    async def role_remove(
-        self,
-        interaction: discord.Interaction,
-        member: discord.Member,
-        role: discord.Role
-    ):
-        officer_role = discord.utils.get(
-            interaction.guild.roles,
-            name="Officer"
-        )
-
-        if officer_role is None:
-            await interaction.response.send_message(
-                "The Officer role could not be found.",
-                ephemeral=True
-            )
-            return
-
-        if officer_role not in interaction.user.roles:
-            await interaction.response.send_message(
-                "You must be an Officer to use this command.",
-                ephemeral=True
-            )
-            return
-
-        try:
-            await member.remove_roles(role)
-
-            await interaction.response.send_message(
-                f"Successfully removed {role.mention} from {member.mention}."
-            )
-
-        except discord.Forbidden:
-            await interaction.response.send_message(
-                "I don't have permission to remove that role. Check my role hierarchy.",
-                ephemeral=True
-            )
 
 
 async def setup(bot):

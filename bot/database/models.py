@@ -1,3 +1,40 @@
+"""Database schema and the record types repositories return.
+
+There is no migration tool yet. Every statement here is idempotent so that
+`create_all_tables` can run on every startup, including against databases
+created by earlier versions of this file (the ALTER TABLE statements add
+columns those versions did not have).
+"""
+
+from dataclasses import dataclass
+from datetime import datetime
+
+
+# --------------------------------------------------
+# CATEGORIES
+# --------------------------------------------------
+
+# Role categories (DESIGN.md §2.2). Organizational authority (Officer) comes
+# from OFFICER_ROLE_ID, and project authority from project_managers, so
+# neither is stored as a role category here.
+ROLE_CATEGORY_MEMBERSHIP = "membership"
+ROLE_CATEGORY_FUNCTIONAL = "functional"
+ROLE_CATEGORY_SPECIAL = "special"
+ROLE_CATEGORIES = (
+    ROLE_CATEGORY_MEMBERSHIP,
+    ROLE_CATEGORY_FUNCTIONAL,
+    ROLE_CATEGORY_SPECIAL,
+)
+
+LEADERSHIP_LEAD = "lead"
+LEADERSHIP_MANAGER = "manager"
+LEADERSHIP_LEVELS = (LEADERSHIP_LEAD, LEADERSHIP_MANAGER)
+
+
+# --------------------------------------------------
+# SCHEMA
+# --------------------------------------------------
+
 CREATE_MEMBERS_TABLE = """
 CREATE TABLE IF NOT EXISTS members (
     discord_id BIGINT PRIMARY KEY,
@@ -12,6 +49,8 @@ CREATE TABLE IF NOT EXISTS roles (
     name VARCHAR(100) UNIQUE NOT NULL,
     category VARCHAR(50) NOT NULL
 );
+ALTER TABLE roles ADD COLUMN IF NOT EXISTS discord_role_id BIGINT;
+CREATE UNIQUE INDEX IF NOT EXISTS roles_discord_role_id_key ON roles (discord_role_id);
 """
 
 CREATE_MEMBER_ROLES_TABLE = """
@@ -30,6 +69,8 @@ CREATE TABLE IF NOT EXISTS projects (
     description TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS discord_role_id BIGINT;
+CREATE UNIQUE INDEX IF NOT EXISTS projects_discord_role_id_key ON projects (discord_role_id);
 """
 
 CREATE_PROJECT_MEMBERS_TABLE = """
@@ -41,37 +82,84 @@ CREATE TABLE IF NOT EXISTS project_members (
 );
 """
 
-from bot.database.connection import get_connection
+# Project leadership is kept separate from ordinary project membership
+# (DESIGN.md §6.3). A member holds at most one level per project.
+CREATE_PROJECT_MANAGERS_TABLE = """
+CREATE TABLE IF NOT EXISTS project_managers (
+    project_id INTEGER REFERENCES projects(id) ON DELETE CASCADE,
+    member_id BIGINT REFERENCES members(discord_id) ON DELETE CASCADE,
+    level VARCHAR(20) NOT NULL CHECK (level IN ('lead', 'manager')),
+    assigned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (project_id, member_id)
+);
+"""
+
+# actor_id and target_id are deliberately not foreign keys: audit records
+# must survive the deletion of the members they mention.
+CREATE_AUDIT_LOGS_TABLE = """
+CREATE TABLE IF NOT EXISTS audit_logs (
+    id BIGSERIAL PRIMARY KEY,
+    actor_id BIGINT NOT NULL,
+    action VARCHAR(100) NOT NULL,
+    target_id BIGINT,
+    details JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS audit_logs_target_idx ON audit_logs (target_id);
+"""
+
+ALL_TABLES = (
+    CREATE_MEMBERS_TABLE,
+    CREATE_ROLES_TABLE,
+    CREATE_MEMBER_ROLES_TABLE,
+    CREATE_PROJECTS_TABLE,
+    CREATE_PROJECT_MEMBERS_TABLE,
+    CREATE_PROJECT_MANAGERS_TABLE,
+    CREATE_AUDIT_LOGS_TABLE,
+)
 
 
-def create_members_table():
-    with get_connection() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(CREATE_MEMBERS_TABLE)
+async def create_all_tables(conn):
+    """Create or upgrade every table. Takes an open AsyncConnection."""
 
-def create_roles_table():
-    with get_connection() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(CREATE_ROLES_TABLE)
+    async with conn.transaction():
+        async with conn.cursor() as cursor:
+            for statement in ALL_TABLES:
+                await cursor.execute(statement)
 
-def create_member_roles_table():
-    with get_connection() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(CREATE_MEMBER_ROLES_TABLE)
 
-def create_projects_table():
-    with get_connection() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(CREATE_PROJECTS_TABLE)
+# --------------------------------------------------
+# RECORDS
+# --------------------------------------------------
 
-def create_project_members_table():
-    with get_connection() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(CREATE_PROJECT_MEMBERS_TABLE)
+@dataclass(frozen=True)
+class MemberRecord:
+    discord_id: int
+    username: str
+    joined_at: datetime | None = None
 
-def create_all_tables():
-    create_members_table()
-    create_roles_table()
-    create_member_roles_table()
-    create_projects_table()
-    create_project_members_table()
+
+@dataclass(frozen=True)
+class RoleRecord:
+    id: int
+    name: str
+    category: str
+    discord_role_id: int | None
+
+
+@dataclass(frozen=True)
+class ProjectRecord:
+    id: int
+    name: str
+    description: str | None
+    discord_role_id: int | None
+    created_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class LeaderRecord:
+    project_id: int
+    project_name: str
+    member_id: int
+    username: str
+    level: str
